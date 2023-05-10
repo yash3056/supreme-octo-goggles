@@ -213,6 +213,226 @@ static int llcc_update_act_ctrl(u32 sid,
 	return ret;
 }
 
+static inline int llcc_spad_check_regmap(void)
+{
+	if (IS_ERR(drv_data->spad_or_bcast_regmap))
+		return PTR_ERR(drv_data->spad_or_bcast_regmap);
+	if (IS_ERR(drv_data->spad_and_bcast_regmap))
+		return PTR_ERR(drv_data->spad_and_bcast_regmap);
+	return 0;
+}
+
+static inline int llcc_spad_clk_on_ctrl(void)
+{
+	u32 lpi_reg;
+	u32 lpi_val;
+
+	/* Clear FF_CLK_ON override and override value CSR */
+	lpi_reg = SPAD_LPI_LB_FF_CLK_ON_CTRL;
+	regmap_read(drv_data->spad_or_bcast_regmap, lpi_reg, &lpi_val);
+	lpi_val &= ~(FF_CLK_ON_OVERRIDE | FF_CLK_ON_OVERRIDE_VALUE);
+	return regmap_write(drv_data->spad_or_bcast_regmap, lpi_reg, lpi_val);
+}
+
+static int llcc_spad_poll_state(struct llcc_slice_desc *desc, u32 s0, u32 s1)
+{
+	int ret;
+	u32 slice_status;
+	struct regmap *spad_regmap;
+
+	if ((s0 == ACTIVE_STATE) && (s1 == ACTIVE_STATE_7MB))
+		spad_regmap = drv_data->spad_or_bcast_regmap;
+	else
+		spad_regmap = drv_data->spad_and_bcast_regmap;
+
+	ret = regmap_read_poll_timeout(spad_regmap,
+				       SPAD_LPI_LB_PCB_PWR_STATUS0,
+				       slice_status,
+				       (slice_status == s0),
+				       0, LLCC_STATUS_READ_DELAY);
+	if (ret)
+		return ret;
+	ret = regmap_read_poll_timeout(spad_regmap,
+				       SPAD_LPI_LB_PCB_PWR_STATUS1,
+				       slice_status,
+				       (slice_status == s0),
+				       0, LLCC_STATUS_READ_DELAY);
+	if (ret)
+		return ret;
+	ret = regmap_read_poll_timeout(spad_regmap,
+				       SPAD_LPI_LB_PCB_PWR_STATUS2,
+				       slice_status,
+				       (slice_status == s0),
+				       0, LLCC_STATUS_READ_DELAY);
+	if (ret)
+		return ret;
+	/* For all instances of 7MB per scratchpad */
+	if (desc->slice_size == SZ_7MB) {
+		ret = regmap_read_poll_timeout(spad_regmap,
+					       SPAD_LPI_LB_PCB_PWR_STATUS3,
+					       slice_status,
+					       (slice_status == s1),
+					       0, LLCC_STATUS_READ_DELAY);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+static int llcc_spad_act_slp_wake(void)
+{
+	int ret;
+	u32 lpi_reg;
+	u32 lpi_val;
+
+	/* Before enabling activity based wakeup/sleep, CSR based sleep/wakeup
+	 * needs to be disabled as both these modes are mutually exclusive.
+	 */
+	lpi_reg = SPAD_LPI_LB_PCB_CMD;
+	lpi_val = 0;
+	ret = regmap_write(drv_data->spad_or_bcast_regmap, lpi_reg,
+			   lpi_val);
+	if (ret)
+		return ret;
+
+	/* Enable activity based (rd & wr tx) sleep and wakeup (hardware
+	 * triggered sleep and wakeup).
+	 */
+	lpi_reg = SPAD_LPI_LB_PCB_ENABLE;
+	lpi_val = WAKEUP_ENABLE | SLP_ENABLE;
+	ret = regmap_write(drv_data->spad_or_bcast_regmap, lpi_reg,
+			   lpi_val);
+	if (ret)
+		return ret;
+	lpi_reg = SPAD_LPI_LB_CLK_EN_CFG;
+	regmap_read(drv_data->spad_or_bcast_regmap, lpi_reg, &lpi_val);
+	lpi_val |= SLP_CTRL_CLK_EN;
+	ret = regmap_write(drv_data->spad_or_bcast_regmap, lpi_reg,
+			   lpi_val);
+	if (ret)
+		return ret;
+	lpi_reg = SPAD_LPI_LB_PRED_WAKEUP_EN;
+	lpi_val = WR_ENABLE;
+	ret = regmap_write(drv_data->spad_or_bcast_regmap, lpi_reg,
+			   lpi_val);
+	if (ret)
+		return ret;
+
+	/* As activity based sleep and wakeup tracks inflight transactions,
+	 * idle cycles etc for an PCB few other CSRs needs to be configured
+	 * too.
+	 */
+	lpi_reg = SPAD_LPI_LB_RAM_IDLE_THRESHOLD;
+	lpi_val = IDLE_THRESHOLD_VAL;
+	ret = regmap_write(drv_data->spad_or_bcast_regmap, lpi_reg,
+			   lpi_val);
+	if (ret)
+		return ret;
+
+	/* As in SPAD we are working with 3 clock domains (ff, core, cfg),
+	 * few other CSRs needs to be configured too in order to avoid race
+	 * condition between sleep/wakeup signals which is generated in ff
+	 * clock domain internal to sleep controller and SPAD ACH and WCH
+	 * going into lpi_lb_drp module which is in core clk domain.
+	 */
+	lpi_val |= (EARLY_IDLE_EXCEED_INDICATION_THRESHOLD_VAL << 20);
+	ret = regmap_write(drv_data->spad_or_bcast_regmap, lpi_reg,
+			   lpi_val);
+	if (ret)
+		return ret;
+
+	/* Similarly to avoid CDC demet errors while syncing if_counter_is_zero
+	 * from core clk to ff clk domain we also have to configure another CSR
+	 * which lets the sleep controller to sample if_counter_is_zero signal
+	 * (core clk domain) every N cycle before syncing it in ff clk domain.
+	 */
+	lpi_reg = SPAD_LPI_LB_COUNTER_SYNC_RATE;
+	lpi_val = IFCOUNTER_IS_ZERO_VAL;
+	ret = regmap_write(drv_data->spad_or_bcast_regmap, lpi_reg,
+			   lpi_val);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
+static int llcc_spad_init(struct llcc_slice_desc *desc)
+{
+	int ret;
+	u32 lpi_reg;
+	u32 lpi_val;
+
+	/* FF clock will be on as during initialization the
+	 * following CSR will be 1
+	 */
+	lpi_reg = SPAD_LPI_LB_FF_CLK_ON_CTRL;
+	regmap_read(drv_data->spad_or_bcast_regmap, lpi_reg, &lpi_val);
+	lpi_val |= FF_CLK_ON_OVERRIDE | FF_CLK_ON_OVERRIDE_VALUE;
+	ret = regmap_write(drv_data->spad_or_bcast_regmap, lpi_reg,
+			   lpi_val);
+	if (ret)
+		return ret;
+
+	/* Activity based sleep/wakeup CSRs should be tied to 0 as
+	 * activity based sleep/wkup is mutually exclusive to CSR
+	 * based sleep and wakeup.
+	 */
+	lpi_reg = SPAD_LPI_LB_PCB_ENABLE;
+	lpi_val = 0;
+	ret = regmap_write(drv_data->spad_or_bcast_regmap, lpi_reg,
+			   lpi_val);
+	if (ret)
+		return ret;
+	lpi_reg = SPAD_LPI_LB_PRED_WAKEUP_EN;
+	lpi_val = 0;
+	ret = regmap_write(drv_data->spad_or_bcast_regmap, lpi_reg,
+			   lpi_val);
+	if (ret)
+		return ret;
+
+	/* Schedule Wakeup for all PCBs */
+	lpi_reg = SPAD_LPI_LB_PCB_WAKEUP_SEL0;
+	lpi_val = 0xFFFFFFFF;
+	ret = regmap_write(drv_data->spad_or_bcast_regmap, lpi_reg,
+			   lpi_val);
+	if (ret)
+		return ret;
+	lpi_reg = SPAD_LPI_LB_PCB_WAKEUP_SEL1;
+	/* For all instances of 7MB per scratchpad */
+	if (desc->slice_size == SZ_7MB)
+		lpi_val = 0xFFFFFF;
+	/* For all instances of 6MB per scratchpad */
+	else if (desc->slice_size == SZ_6MB)
+		lpi_val = 0x00FFFF;
+	ret = regmap_write(drv_data->spad_or_bcast_regmap, lpi_reg,
+			   lpi_val);
+	if (ret)
+		return ret;
+
+	lpi_reg = SPAD_LPI_LB_PCB_CMD;
+	lpi_val = WAKEUP_COMMAND;
+	ret = regmap_write(drv_data->spad_or_bcast_regmap, lpi_reg,
+			   lpi_val);
+	if (ret)
+		return ret;
+
+	/* Wait for PCB wakeup to complete */
+	ret = llcc_spad_poll_state(desc, ACTIVE_STATE,
+				   ACTIVE_STATE_7MB);
+	if (ret)
+		return ret;
+
+	/* Clear wakeup command after all scheduled wakeups are done */
+	lpi_reg = SPAD_LPI_LB_PCB_CMD;
+	lpi_val = 0;
+	ret = regmap_write(drv_data->spad_or_bcast_regmap, lpi_reg,
+			   lpi_val);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
 /**
  * llcc_slice_activate - Activate the llcc slice
  * @desc: Pointer to llcc slice descriptor

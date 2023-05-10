@@ -13,6 +13,11 @@
 #include <linux/of_platform.h>
 #include <linux/pm_opp.h>
 #include <linux/slab.h>
+#include <linux/qcom-cpufreq-hw.h>
+#include <linux/topology.h>
+
+#define CREATE_TRACE_POINTS
+#include <trace/events/dcvsh.h>
 
 #define LUT_MAX_ENTRIES			40U
 #define LUT_SRC				GENMASK(31, 30)
@@ -20,6 +25,33 @@
 #define LUT_CORE_COUNT			GENMASK(18, 16)
 #define LUT_VOLT			GENMASK(11, 0)
 #define CLK_HW_DIV			2
+#define GT_IRQ_STATUS			BIT(2)
+#define MAX_FN_SIZE			20
+#define LIMITS_POLLING_DELAY_MS		4
+
+#define CYCLE_CNTR_OFFSET(core_id, m, acc_count)		\
+			(acc_count ? ((core_id + 1) * 4) : 0)
+
+enum {
+	REG_ENABLE,
+	REG_FREQ_LUT,
+	REG_VOLT_LUT,
+	REG_PERF_STATE,
+	REG_CYCLE_CNTR,
+	REG_DOMAIN_STATE,
+	REG_INTR_EN,
+	REG_INTR_CLR,
+	REG_INTR_STATUS,
+
+	REG_ARRAY_SIZE,
+};
+
+static unsigned long cpu_hw_rate, xo_rate;
+static const u16 *offsets;
+static unsigned int lut_row_size = LUT_ROW_SIZE;
+static unsigned int lut_max_entries = LUT_MAX_ENTRIES;
+static bool accumulative_counter;
+static bool perf_lock_support;
 #define LUT_TURBO_IND			1
 
 struct qcom_cpufreq_soc_data {
@@ -71,6 +103,52 @@ static int qcom_cpufreq_update_opp(struct device *cpu_dev,
 	if (!icc_scaling_enabled)
 		return dev_pm_opp_add(cpu_dev, freq_hz, volt);
 
+	return IRQ_HANDLED;
+}
+
+u64 qcom_cpufreq_get_cpu_cycle_counter(int cpu)
+{
+	struct cpufreq_counter *cpu_counter;
+	struct cpufreq_policy *policy;
+	u64 cycle_counter_ret;
+	unsigned long flags;
+	u16 offset;
+	u32 val;
+
+	policy = cpufreq_cpu_get_raw(cpu);
+	if (!policy)
+		return 0;
+
+	cpu_counter = &qcom_cpufreq_counter[cpu];
+	spin_lock_irqsave(&cpu_counter->lock, flags);
+
+	offset = CYCLE_CNTR_OFFSET(topology_core_id(cpu), policy->related_cpus,
+					accumulative_counter);
+	val = readl_relaxed_no_log(policy->driver_data +
+				    offsets[REG_CYCLE_CNTR] + offset);
+
+	if (val < cpu_counter->prev_cycle_counter) {
+		/* Handle counter overflow */
+		cpu_counter->total_cycle_counter += UINT_MAX -
+			cpu_counter->prev_cycle_counter + val;
+		cpu_counter->prev_cycle_counter = val;
+	} else {
+		cpu_counter->total_cycle_counter += val -
+			cpu_counter->prev_cycle_counter;
+		cpu_counter->prev_cycle_counter = val;
+	}
+	cycle_counter_ret = cpu_counter->total_cycle_counter;
+	spin_unlock_irqrestore(&cpu_counter->lock, flags);
+
+	pr_debug("CPU %u, core-id 0x%x, offset %u\n", cpu, topology_core_id(cpu), offset);
+
+	return cycle_counter_ret;
+}
+EXPORT_SYMBOL_GPL(qcom_cpufreq_get_cpu_cycle_counter);
+
+static int
+qcom_cpufreq_hw_target_index(struct cpufreq_policy *policy,
+			     unsigned int index)
 	ret = dev_pm_opp_adjust_voltage(cpu_dev, freq_hz, volt, volt, volt);
 	if (ret) {
 		dev_err(cpu_dev, "Voltage update failed freq=%ld\n", freq_khz);
