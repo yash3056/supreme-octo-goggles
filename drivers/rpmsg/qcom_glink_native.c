@@ -1685,6 +1685,33 @@ struct qcom_glink *qcom_glink_native_probe(struct device *dev,
 		return ERR_CAST(glink->mbox_chan);
 	}
 
+	kthread_init_worker(&glink->kworker);
+	glink->task = kthread_run(kthread_worker_fn, &glink->kworker,
+				  "glink_%s", glink->name);
+	if (IS_ERR(glink->task)) {
+		dev_err(dev, "failed to spawn intent kthread %ld\n",
+			PTR_ERR(glink->task));
+		return ERR_CAST(glink->task);
+	}
+
+	snprintf(glink->irqname, 32, "glink-native-%s", glink->name);
+
+	glink->ilc = ipc_log_context_create(GLINK_LOG_PAGE_CNT, glink->name, 0);
+
+	return glink;
+}
+EXPORT_SYMBOL(qcom_glink_native_probe);
+int qcom_glink_native_start(struct qcom_glink *glink)
+{
+	struct device *dev = glink->dev;
+	u32 *arr;
+	int size;
+	int irq;
+	int ret;
+
+	spin_lock_init(&glink->irq_lock);
+	glink->irq_running = false;
+
 	irq = of_irq_get(dev->of_node, 0);
 	ret = devm_request_irq(dev, irq,
 			       qcom_glink_native_intr,

@@ -66,3 +66,8 @@ obj-$(CONFIG_USBIP_CORE)	+= usbip/
 obj-$(CONFIG_TYPEC)		+= typec/
 
 obj-$(CONFIG_USB_ROLE_SWITCH)	+= roles/
+
+obj-$(CONFIG_USB_REPEATER)	+= repeater/
+
+obj-$(CONFIG_SELF_USB_REDRIVER)	+= redriver/
+obj-$(CONFIG_USB_REDRIVER)	+= redriver/

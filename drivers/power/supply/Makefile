@@ -98,3 +98,7 @@ obj-$(CONFIG_CHARGER_BD70528)	+= bd70528-charger.o
 obj-$(CONFIG_CHARGER_BD99954)	+= bd99954-charger.o
 obj-$(CONFIG_CHARGER_WILCO)	+= wilco-charger.o
 obj-$(CONFIG_RN5T618_POWER)	+= rn5t618_power.o
+obj-$(CONFIG_SCHGM_FLASH)       += schgm-flash.o
+obj-$(CONFIG_CHARGER_BQ256XX)	+= bq256xx_charger.o
+obj-$(CONFIG_QCOM_POWER_SUPPLY)		+= qcom/
+obj-$(CONFIG_XM_POWER_SUPPLY)		+= xiaomi/

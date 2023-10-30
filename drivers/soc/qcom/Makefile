@@ -25,4 +25,41 @@ obj-$(CONFIG_QCOM_APR) += apr.o
 obj-$(CONFIG_QCOM_LLCC) += llcc-qcom.o
 obj-$(CONFIG_QCOM_RPMHPD) += rpmhpd.o
 obj-$(CONFIG_QCOM_RPMPD) += rpmpd.o
+obj-$(CONFIG_QMP_DEBUGFS_CLIENT) += qmp-debugfs-client.o
+obj-$(CONFIG_QCOM_SMP2P_SLEEPSTATE) += smp2p_sleepstate.o
+obj-$(CONFIG_SENSORS_SSC) += sensors_ssc.o
+obj-$(CONFIG_QCOM_GLINK_PKT) += glink_pkt.o
+obj-$(CONFIG_QSEE_IPC_IRQ) += qsee_ipc_irq.o
+obj-$(CONFIG_QCOM_GLINK) += glink_probe.o
+obj-$(CONFIG_MSM_GLINK_SSR) += msm_glink_ssr.o
+obj-$(CONFIG_QTI_PMIC_GLINK) += pmic_glink.o
+obj-$(CONFIG_QTI_BATTERY_GLINK_DEBUG) += qti_battery_debug.o
+obj-$(CONFIG_QTI_CHARGER_ULOG_GLINK) += charger-ulog-glink.o
+obj-$(CONFIG_QTI_ALTMODE_GLINK) += altmode-glink.o
+obj-$(CONFIG_QTI_PMIC_PON_LOG) += pmic-pon-log.o
+obj-$(CONFIG_MSM_REMOTEQDSS) += remoteqdss.o
+obj-$(CONFIG_MSM_SPSS_UTILS) += spss_utils.o
+obj-$(CONFIG_MSM_IDLE_STATS)	+= lpm-stats.o
+obj-$(CONFIG_MSM_PERFORMANCE) += msm_performance.o
+obj-$(CONFIG_QPNP_PBS) += qpnp-pbs.o
+obj-$(CONFIG_MSM_SPCOM) += spcom.o
+obj-$(CONFIG_QCOM_CDSP_RM) += cdsprm.o
+ifdef CONFIG_XM_MSM54_FSA4480
+obj-$(CONFIG_QCOM_FSA4480_I2C) += fsa4480-i2c-msm54.o
+else
+obj-$(CONFIG_QCOM_FSA4480_I2C) += fsa4480-i2c.o
+endif
+obj-$(CONFIG_SHOW_SUSPEND_EPOCH) += msm_show_epoch.o
+obj-$(CONFIG_QCOM_EUD) += eud.o
+obj-$(CONFIG_QCOM_GUESTVM) += guestvm_loader.o
+obj-$(CONFIG_QCOM_HYP_CORE_CTL) += hyp_core_ctl.o
+obj-$(CONFIG_MSM_QBT_HANDLER) += qbt_handler.o
+obj-$(CONFIG_QTI_CRYPTO_COMMON) += crypto-qti-common.o
+obj-$(CONFIG_QTI_CRYPTO_TZ) += crypto-qti-tz.o
+obj-$(CONFIG_QTI_HW_KEY_MANAGER) += hwkm.o crypto-qti-hwkm.o
+obj-$(CONFIG_QCOM_WDT_CORE) += qcom_wdt_core.o
+obj-$(CONFIG_QCOM_SOC_WATCHDOG) += qcom_soc_wdt.o
+ifdef CONFIG_DEBUG_FS
+obj-$(CONFIG_MSM_RPM_SMD)   +=  rpm-smd-debug.o
+endif
 obj-$(CONFIG_QCOM_KRYO_L2_ACCESSORS) +=	kryo-l2-accessors.o

@@ -41,7 +41,125 @@ static struct ufs_qcom_host *ufs_qcom_hosts[MAX_UFS_QCOM_HOSTS];
 
 static void ufs_qcom_get_default_testbus_cfg(struct ufs_qcom_host *host);
 static int ufs_qcom_set_dme_vs_core_clk_ctrl_clear_div(struct ufs_hba *hba,
-						       u32 clk_cycles);
+						       u32 clk_1us_cycles,
+						       u32 clk_40ns_cycles);
+static void ufs_qcom_parse_limits(struct ufs_qcom_host *host);
+static void ufs_qcom_parse_lpm(struct ufs_qcom_host *host);
+static int ufs_qcom_set_dme_vs_core_clk_ctrl_max_freq_mode(struct ufs_hba *hba);
+static int ufs_qcom_init_sysfs(struct ufs_hba *hba);
+static int ufs_qcom_update_qos_constraints(struct qos_cpu_group *qcg,
+					   enum constraint type);
+static int ufs_qcom_unvote_qos_all(struct ufs_hba *hba);
+static void ufs_qcom_parse_g4_workaround_flag(struct ufs_qcom_host *host);
+static int ufs_qcom_mod_min_cpufreq(unsigned int cpu, s32 new_val);
+static void ufs_qcom_hook_clock_scaling(void *used, struct ufs_hba *hba, bool *force_out,
+		bool *force_saling, bool *scale_up);
+
+static inline void cancel_dwork_unvote_cpufreq(struct ufs_hba *hba)
+{
+	struct ufs_qcom_host *host = ufshcd_get_variant(hba);
+	int err;
+
+	if (host->cpufreq_dis)
+		return;
+
+	cancel_delayed_work_sync(&host->fwork);
+	if (!host->cur_freq_vote)
+		return;
+	atomic_set(&host->num_reqs_threshold, 0);
+
+	err = ufs_qcom_mod_min_cpufreq(host->config_cpu,
+				       host->min_cpu_scale_freq);
+	if (err < 0)
+		dev_err(hba->dev, "fail set cpufreq-fmin_def %d:\n",
+				err);
+	else
+		host->cur_freq_vote = false;
+	dev_dbg(hba->dev, "%s,err=%d\n", __func__, err);
+}
+
+static int ufs_qcom_get_pwr_dev_param(struct ufs_qcom_dev_params *qcom_param,
+				      struct ufs_pa_layer_attr *dev_max,
+				      struct ufs_pa_layer_attr *agreed_pwr)
+{
+	int min_qcom_gear;
+	int min_dev_gear;
+	bool is_dev_sup_hs = false;
+	bool is_qcom_max_hs = false;
+
+	if (dev_max->pwr_rx == FAST_MODE)
+		is_dev_sup_hs = true;
+
+	if (qcom_param->desired_working_mode == FAST) {
+		is_qcom_max_hs = true;
+		min_qcom_gear = min_t(u32, qcom_param->hs_rx_gear,
+				      qcom_param->hs_tx_gear);
+	} else {
+		min_qcom_gear = min_t(u32, qcom_param->pwm_rx_gear,
+				      qcom_param->pwm_tx_gear);
+	}
+
+	/*
+	 * device doesn't support HS but qcom_param->desired_working_mode is
+	 * HS, thus device and qcom_param don't agree
+	 */
+	if (!is_dev_sup_hs && is_qcom_max_hs) {
+		pr_err("%s: failed to agree on power mode (device doesn't support HS but requested power is HS)\n",
+			__func__);
+		return -ENOTSUPP;
+	} else if (is_dev_sup_hs && is_qcom_max_hs) {
+		/*
+		 * since device supports HS, it supports FAST_MODE.
+		 * since qcom_param->desired_working_mode is also HS
+		 * then final decision (FAST/FASTAUTO) is done according
+		 * to qcom_params as it is the restricting factor
+		 */
+		agreed_pwr->pwr_rx = agreed_pwr->pwr_tx =
+						qcom_param->rx_pwr_hs;
+	} else {
+		/*
+		 * here qcom_param->desired_working_mode is PWM.
+		 * it doesn't matter whether device supports HS or PWM,
+		 * in both cases qcom_param->desired_working_mode will
+		 * determine the mode
+		 */
+		agreed_pwr->pwr_rx = agreed_pwr->pwr_tx =
+			qcom_param->rx_pwr_pwm;
+	}
+
+	/*
+	 * we would like tx to work in the minimum number of lanes
+	 * between device capability and vendor preferences.
+	 * the same decision will be made for rx
+	 */
+	agreed_pwr->lane_tx = min_t(u32, dev_max->lane_tx,
+						qcom_param->tx_lanes);
+	agreed_pwr->lane_rx = min_t(u32, dev_max->lane_rx,
+						qcom_param->rx_lanes);
+
+	/* device maximum gear is the minimum between device rx and tx gears */
+	min_dev_gear = min_t(u32, dev_max->gear_rx, dev_max->gear_tx);
+
+	/*
+	 * if both device capabilities and vendor pre-defined preferences are
+	 * both HS or both PWM then set the minimum gear to be the chosen
+	 * working gear.
+	 * if one is PWM and one is HS then the one that is PWM get to decide
+	 * what is the gear, as it is the one that also decided previously what
+	 * pwr the device will be configured to.
+	 */
+	if ((is_dev_sup_hs && is_qcom_max_hs) ||
+	    (!is_dev_sup_hs && !is_qcom_max_hs))
+		agreed_pwr->gear_rx = agreed_pwr->gear_tx =
+			min_t(u32, min_dev_gear, min_qcom_gear);
+	else if (!is_dev_sup_hs)
+		agreed_pwr->gear_rx = agreed_pwr->gear_tx = min_dev_gear;
+	else
+		agreed_pwr->gear_rx = agreed_pwr->gear_tx = min_qcom_gear;
+
+	agreed_pwr->hs_rate = qcom_param->hs_rate;
+	return 0;
+}
 
 static struct ufs_qcom_host *rcdev_to_ufs_host(struct reset_controller_dev *rcd)
 {
@@ -285,6 +403,13 @@ static int ufs_qcom_host_reset(struct ufs_hba *hba)
 				 __func__, ret);
 
 	usleep_range(1000, 1100);
+	/*
+	 * The ice registers are also reset to default values after a ufs
+	 * host controller reset. Reset the ice internal software flags here
+	 * so that the ice hardware will be re-initialized properly in the
+	 * later part of the UFS host controller reset.
+	 */
+	ufs_qcom_ice_disable(host);
 
 	if (reenable_intr) {
 		enable_irq(hba->irq);
@@ -1000,6 +1125,9 @@ static int ufs_qcom_init(struct ufs_hba *hba)
 	/* Make a two way bind between the qcom host and the hba */
 	host->hba = hba;
 	ufshcd_set_variant(hba, host);
+	ut = &host->uqt;
+	host->crash_on_err =
+		of_property_read_bool(np, "qcom,enable_crash_on_err");
 
 	/* Setup the reset control of HCI */
 	host->core_reset = devm_reset_control_get(hba->dev, "rst");
@@ -1432,6 +1560,215 @@ static void ufs_qcom_dump_dbg_regs(struct ufs_hba *hba)
 			 "HCI Vendor Specific Registers ");
 
 	ufs_qcom_print_hw_debug_reg_all(hba, NULL, ufs_qcom_dump_regs_wrapper);
+
+	if (in_task()) {
+		usleep_range(1000, 1100);
+		ufs_qcom_testbus_read(hba);
+		usleep_range(1000, 1100);
+		ufs_qcom_print_unipro_testbus(hba);
+		usleep_range(1000, 1100);
+		ufs_qcom_print_utp_hci_testbus(hba);
+		usleep_range(1000, 1100);
+		ufs_qcom_phy_dbg_register_dump(phy);
+	}
+
+	BUG_ON(host->crash_on_err);
+}
+
+/*
+ * Read sdam register for ufs device identification using
+ * nvmem interface and accordingly set phy submode.
+ * sdam Value = 0 : UFS 3.x, phy_submode = 1.
+ * sdam Value = 1 : UFS 2.x, phy_submode = 0.
+ */
+void ufs_qcom_read_nvmem_cell(struct ufs_qcom_host *host)
+{
+	size_t len;
+	u8 *data;
+	bool ufs_dev;
+
+	host->nvmem_cell = nvmem_cell_get(host->hba->dev, "ufs_dev");
+	if (IS_ERR(host->nvmem_cell)) {
+		dev_info(host->hba->dev, "(%s) Failed to get nvmem cell\n", __func__);
+		return;
+	}
+
+	data = (u8 *)nvmem_cell_read(host->nvmem_cell, &len);
+	if (IS_ERR(data)) {
+		dev_info(host->hba->dev, "(%s) Failed to read from nvmem\n", __func__);
+		goto cell_put;
+	}
+
+	ufs_dev = *data;
+	/* Revert as below
+	 * Value = 0 : UFS 3.x
+	 * Value = 1 : UFS 2.x
+	 */
+	if (host->ufs_dev_revert)
+		host->limit_phy_submode = ufs_dev;
+	else
+		host->limit_phy_submode = !ufs_dev;
+
+	if (host->limit_phy_submode)
+		dev_info(host->hba->dev, "(%s) UFS device is 3.x, phy_submode = %d\n",
+						__func__, host->limit_phy_submode);
+	else
+		dev_info(host->hba->dev, "(%s) UFS device is 2.x, phy_submode = %d\n",
+						__func__, host->limit_phy_submode);
+
+	kfree(data);
+
+cell_put:
+	nvmem_cell_put(host->nvmem_cell);
+}
+
+/*
+ * ufs_qcom_parse_limits - read limits from DTS
+ */
+static void ufs_qcom_parse_limits(struct ufs_qcom_host *host)
+{
+	struct device_node *np = host->hba->dev->of_node;
+
+	if (!np)
+		return;
+
+	host->limit_tx_hs_gear = UFS_QCOM_LIMIT_HSGEAR_TX;
+	host->limit_rx_hs_gear = UFS_QCOM_LIMIT_HSGEAR_RX;
+	host->limit_tx_pwm_gear = UFS_QCOM_LIMIT_PWMGEAR_TX;
+	host->limit_rx_pwm_gear = UFS_QCOM_LIMIT_PWMGEAR_RX;
+	host->limit_rate = UFS_QCOM_LIMIT_HS_RATE;
+	host->limit_phy_submode = UFS_QCOM_LIMIT_PHY_SUBMODE;
+	host->ufs_dev_types = 0;
+
+	of_property_read_u32(np, "limit-tx-hs-gear", &host->limit_tx_hs_gear);
+	of_property_read_u32(np, "limit-rx-hs-gear", &host->limit_rx_hs_gear);
+	of_property_read_u32(np, "limit-tx-pwm-gear", &host->limit_tx_pwm_gear);
+	of_property_read_u32(np, "limit-rx-pwm-gear", &host->limit_rx_pwm_gear);
+	of_property_read_u32(np, "limit-rate", &host->limit_rate);
+	of_property_read_u32(np, "limit-phy-submode", &host->limit_phy_submode);
+	of_property_read_u32(np, "ufs-dev-types", &host->ufs_dev_types);
+	host->ufs_dev_revert = of_property_read_bool(np, "qcom,ufs-dev-revert");
+
+
+	if (host->ufs_dev_types >= 2)
+		ufs_qcom_read_nvmem_cell(host);
+}
+
+/*
+ * ufs_qcom_parse_g4_workaround_flag - read bypass-g4-cfgready entry from DT
+ */
+static void ufs_qcom_parse_g4_workaround_flag(struct ufs_qcom_host *host)
+{
+	struct device_node *np = host->hba->dev->of_node;
+	const char *str  = "bypass-g4-cfgready";
+
+	if (!np)
+		return;
+
+	host->bypass_g4_cfgready = of_property_read_bool(np, str);
+}
+
+/**
+ * ufs_qcom_hook_clock_scaling -  Influence the UFS clock scaling policy
+ * @force_out: flag to decide whether to skip scale up/down check in ufshcd_devfreq_target
+ * @force_scaling: Decide whether to do force scaling in ufshcd_devfreq_target
+ * @scale_up: scale up or down request coming from devfreq
+ *
+ * This API Updates force_out, force_scaling and scale_up parameter before returning.
+ * It also updates clk_next_mode and is_turbo_enabled. Based on this, required setting
+ * would be applied as part of clk scaling pre and post
+ * sequence. At end of clk scaling post sequence clk_curr_mode would be updated with
+ * clk_next_mode value.
+ */
+static void ufs_qcom_hook_clock_scaling(void *unused, struct ufs_hba *hba, bool *force_out,
+	bool *force_scaling, bool *scale_up)
+{
+	/*
+	 * TURBO_DOWN_THRESHOLD is the busy% threshold to scale down from TURBO to NOM.
+	 *
+	 * TODO: Need to adjust threshold taking into account of power and perf tradeoff
+	 */
+	#define TURBO_DOWN_THRESHOLD         50
+	struct ufs_qcom_host *host = ufshcd_get_variant(hba);
+	struct devfreq_dev_status *stat = &hba->devfreq->last_status;
+	struct ufs_clk_info *clki;
+	int busy_percentage;
+	unsigned long core_clk_rate = 0;
+
+	if (!host->ml_scale_sup)
+		return;
+
+	/*
+	 * Return if clock scaling is disabled,scaled
+	 * up called during disabling clkscale(sysfs)
+	 * will take care of scaling to max clk freq.
+	 */
+	if (!hba->clk_scaling.is_enabled) {
+		*force_out = true;
+		return;
+	}
+
+	busy_percentage = (stat->busy_time * 100)/(stat->total_time);
+	clki = list_first_entry(&hba->clk_list_head, struct ufs_clk_info, list);
+	core_clk_rate = host->curr_axi_freq;
+
+	/*
+	 * In case of clk scale down, we align with devfreq i.e we
+	 * scale down from either TURBO(TURBO_L1) or NOM to LOW_SVS if
+	 * scale down is received from devfreq
+	 */
+	if (!(*scale_up)) {
+		*force_out = false;
+		*force_scaling = false;
+		host->turbo_down_thres_cnt = 0;
+		return;
+	}
+	/* This is scale_up from LOW_SVS to TURBO */
+	if (core_clk_rate == clki->min_freq) {
+		*force_out = false;
+		*force_scaling = false;
+		host->turbo_down_thres_cnt = 0;
+		return;
+	} else if (core_clk_rate > UFS_NOM_THRES_FREQ) {
+		/* We are currently operating in TURBO freq */
+		if (busy_percentage < TURBO_DOWN_THRESHOLD) {
+			/*
+			 * To avoid ping-pong b/w different clk mode ,
+			 * have a threshold count to scale down from TURBO
+			 * to NOM mode.
+			 */
+			if (++host->turbo_down_thres_cnt == 2) {
+				/* We need to scale down from TURBO or TURBO_L1 to NOM */
+				*force_out = false;
+				*force_scaling = true;
+				*scale_up = true;
+				host->turbo_down_thres_cnt = 0;
+				return;
+			}
+		} else {
+			/* Continue with TURBO clk freq */
+			host->turbo_down_thres_cnt = 0;
+			*force_out = true;
+			*force_scaling = false;
+			return;
+		}
+	} else {
+		*force_out = false;
+		*force_scaling = false;
+		 host->turbo_down_thres_cnt = 0;
+	}
+}
+/*
+ * ufs_qcom_parse_lpm - read from DTS whether LPM modes should be disabled.
+ */
+static void ufs_qcom_parse_lpm(struct ufs_qcom_host *host)
+{
+	struct device_node *node = host->hba->dev->of_node;
+
+	host->disable_lpm = of_property_read_bool(node, "qcom,disable-lpm");
+	if (host->disable_lpm)
+		dev_info(host->hba->dev, "(%s) All LPM is disabled\n",
+			 __func__);
 }
 
 /**

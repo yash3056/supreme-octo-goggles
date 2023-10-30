@@ -583,6 +583,27 @@ int qcom_scm_pas_shutdown(u32 peripheral)
 }
 EXPORT_SYMBOL(qcom_scm_pas_shutdown);
 
+int qcom_scm_pas_shutdown_retry(u32 peripheral)
+{
+	int ret;
+	int retry_num = 0;
+
+	ret = qcom_scm_pas_shutdown(peripheral);
+	if (!ret)
+		return ret;
+
+	pr_err("PAS Shutdown: First call to shutdown failed with error: %d\n", ret);
+	while (retry_num < pas_shutdown_retry_max && ret) {
+		retry_num++;
+		msleep(pas_shutdown_retry_interval);
+		ret = qcom_scm_pas_shutdown(peripheral);
+	}
+	pr_err("PAS Shutdown: Attempting to shutdown peripheral %d time(s)\n", retry_num);
+
+	return ret;
+}
+EXPORT_SYMBOL(qcom_scm_pas_shutdown_retry);
+
 /**
  * qcom_scm_pas_supported() - Check if the peripheral authentication service is
  *			      available for the given peripherial

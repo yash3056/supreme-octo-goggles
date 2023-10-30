@@ -170,7 +170,6 @@ static void __qrtr_node_release(struct kref *kref)
 	struct qrtr_tx_flow *flow;
 	unsigned long flags;
 	void __rcu **slot;
-
 	spin_lock_irqsave(&qrtr_nodes_lock, flags);
 	if (node->nid != QRTR_EP_NID_AUTO)
 		radix_tree_delete(&qrtr_nodes, node->nid);
@@ -993,8 +992,13 @@ static int qrtr_send_resume_tx(struct qrtr_cb *cb)
 		return -EINVAL;
 
 	skb = qrtr_alloc_ctrl_packet(&pkt);
-	if (!skb)
-		return -ENOMEM;
+
+	if (!skb) {
+		qrtr_log_resume_tx(cb->src_node, cb->src_port,
+				   RTX_CTRL_SKB_ALLOC_FAIL);
+		qrtr_node_release(node);
+ 		return -ENOMEM;
+	}
 
 	pkt->cmd = cpu_to_le32(QRTR_TYPE_RESUME_TX);
 	pkt->client.node = cpu_to_le32(cb->dst_node);
